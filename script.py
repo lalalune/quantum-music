@@ -3,9 +3,9 @@ import cirq
 import numpy as np
 import wave
 import os
-import tensorflow as tf
-import tensorflow_quantum as tfq
-import gc
+import soundfile as sf
+from scipy.fft import fft, ifft
+import matplotlib.pyplot as plt
 
 # Define a function to read a wave file into a numpy array
 def read_wav_file(filename):
@@ -19,25 +19,39 @@ def read_wav_file(filename):
 
     return wave_data, framerate
 
-# Define a function to create a quantum circuit that encodes a chunk of wave data
-def create_circuit(wave_data_chunk, qubits):
+# Define a function to create a quantum circuit that encodes a chunk of Fourier data
+def create_circuit(fft_data_chunk, qubits):
     print('Creating circuit')
     circuit = cirq.Circuit()
 
-    for i, sample in enumerate(wave_data_chunk):
-        rotation_angle = 2 * np.pi * sample
-        phase_angle = 2 * np.pi * i / len(wave_data_chunk)
+    # Apply QFT
+    for i, _ in enumerate(qubits):
+        for j in range(i):
+            circuit.append(cirq.CZPowGate(exponent=-1/2**(i - j))(qubits[i], qubits[j]))
+        circuit.append(cirq.H(qubits[i]))
+    for i in range(len(qubits) // 2):
+        circuit.append(cirq.SWAP(qubits[i], qubits[-i-1]))
 
-        circuit.append(cirq.rx(rotation_angle)(qubits[i]))
-        circuit.append(cirq.rz(phase_angle)(qubits[i]))
+    # Encode the Fourier transform data
+    for i, fft_coefficient in enumerate(fft_data_chunk):
+        magnitude = np.abs(fft_coefficient)
+        phase = np.angle(fft_coefficient)
+        circuit.append(cirq.rz(magnitude)(qubits[i]))
+        circuit.append(cirq.rx(phase)(qubits[i]))
 
     return circuit
 
 # Read the wave data from the file
-wave_data, _ = read_wav_file('kick.wav')
+wave_data, framerate = read_wav_file('kick.wav')
 
 # Define the number of qubits in each circuit
-n_qubits = 24
+n_qubits = 16
+
+# Set the max samples
+MAX_SAMPLES = 1000
+
+# Take only the first MAX_SAMPLES from the wave data
+wave_data = wave_data[:MAX_SAMPLES]
 
 # Create a list of qubits for the quantum circuit
 qubits = [cirq.GridQubit(0, i) for i in range(n_qubits)]
@@ -49,37 +63,59 @@ n_chunks = len(wave_data) // n_qubits
 if not os.path.exists('data'):
     os.makedirs('data')
 
-# Create a list to hold all the circuits
-circuits = []
+# Create a .wav file to hold the output
+outfile = sf.SoundFile('output.wav', 'w', samplerate=framerate, channels=1, subtype='PCM_16')
+
+# Initialize an empty list to hold the output data for spectrogram
+output_data = []
 
 # Iterate over each chunk
 for i in range(n_chunks):
     # Get the wave data chunk
     wave_data_chunk = wave_data[i * n_qubits: (i + 1) * n_qubits]
 
-    # Create a quantum circuit for the wave data chunk
-    circuit = create_circuit(wave_data_chunk, qubits)
+    # Perform Fourier Transform on the wave data chunk
+    fft_data_chunk = fft(wave_data_chunk)
 
-    # Add the circuit to the list of circuits
-    circuits.append(circuit)
+    # Create a quantum circuit for the FFT data chunk
+    circuit = create_circuit(fft_data_chunk, qubits)
 
-    # Save the circuit as a .qasm file
-    with open(f'data/circuit_{i}.qasm', 'w') as f:
-        f.write(cirq.qasm(circuit))
-    
-    # Explicitly delete the circuit object
-    del circuit
-    # Call the garbage collector
-    gc.collect()
+    # Save the circuit as a .json file
+    cirq.to_json(circuit, f'data/circuit_{i}.json')
 
-# Convert the Cirq circuits to TensorFlow Quantum circuits
-tfq_circuits = tfq.convert_to_tensor(circuits)
+    # Simulate the quantum circuit
+    simulator = cirq.Simulator()
+    result = simulator.simulate(circuit)
+    simulated_final_state = result.final_state_vector
 
-# Initialize a state vector layer
-state = tfq.layers.State()
+    # Perform Inverse Fourier Transform on the simulated final state to get the simulated wave data chunk
+    simulated_wave_data_chunk = ifft(simulated_final_state)
 
-# Get the state vectors for the circuits
-output_state_vectors = state(tfq_circuits)
+    # Normalize the simulated wave data chunk to the range [-1, 1]
+    simulated_wave_data_chunk = simulated_wave_data_chunk * 1.0 / (max(abs(simulated_wave_data_chunk)))
 
-# Print the output state vectors
-print(f"Output state vectors: {output_state_vectors}")
+    # Convert the simulated wave data chunk to 16-bit PCM
+    simulated_wave_data_chunk_pcm = np.int16(simulated_wave_data_chunk * 32767)
+
+    # Append the simulated wave data chunk to the output data
+    output_data.extend(simulated_wave_data_chunk_pcm)
+
+    # Write the simulated wave data chunk to the .wav file
+    outfile.write(simulated_wave_data_chunk_pcm)
+
+# Close the .wav file
+outfile.close()
+
+# Convert output data to numpy array
+output_data = np.array(output_data)
+
+# Create spectrograms
+plt.specgram(wave_data, Fs=framerate)
+plt.title('Input Spectrogram')
+plt.savefig('input_spectrogram.png')
+
+plt.specgram(output_data, Fs=framerate)
+plt.title('Output Spectrogram')
+plt.savefig('output_spectrogram.png')
+
+print('Finished')
